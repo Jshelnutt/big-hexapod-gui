@@ -2,6 +2,9 @@
 
 Easy LAN control UI for the **Freenove Big Hexapod Robot Kit (FNK0052)** on a **Raspberry Pi 5**.
 
+**New here / not a programmer?** Start with the plain-English checklist:  
+**[Get the robot talking](docs/get-the-robot-talking.md)** — prove Freenove’s official Wi‑Fi control works first, then use this app.
+
 This app is a **thin TCP client** to the stock Freenove `Code/Server`. It does **not** reimplement gait, kinematics, or servo timing.
 
 ## Architecture (v0)
