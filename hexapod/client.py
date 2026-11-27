@@ -3,6 +3,11 @@
 The stock server accepts ONE controller and only re-opens its ports after the
 previous client disconnects cleanly, so this client always sends a stop and
 closes both sockets on disconnect, and retries a connect a few times.
+
+While a continuous walk is running it also repeats that walk command every
+``KEEPALIVE_INTERVAL`` seconds. The Pi-side watchdog (see ``pi/``) halts the
+robot after about a second of silence, so if this app, the computer or the Wi-Fi
+dies mid-walk the robot stops by itself.
 """
 
 from __future__ import annotations
@@ -20,6 +25,10 @@ from .mock_frame import MOCK_JPEG
 
 log = logging.getLogger(__name__)
 
+# How often a running walk command is repeated. Must stay well under the Pi-side
+# watchdog's ~1 second timeout.
+KEEPALIVE_INTERVAL = 0.4
+
 
 class FreenoveClient:
     """Thin LAN client. Does not implement gait/servos — talks to stock Server."""
@@ -33,6 +42,12 @@ class FreenoveClient:
         self._reader_thread: Optional[threading.Thread] = None
         self._stop_video = threading.Event()
         self._stop_reader = threading.Event()
+        # Keep-alive: the walk command to repeat (None = nothing walking).
+        self._repeat_lock = threading.RLock()
+        self._repeat_line: Optional[str] = None
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._stop_keepalive = threading.Event()
+        self.keepalive_interval = KEEPALIVE_INTERVAL
         self.latest_jpeg: Optional[bytes] = None
         self.last_reply: str = ""
         self.lost_reason: str = ""
@@ -74,6 +89,7 @@ class FreenoveClient:
         cmd = socket.create_connection((host, proto.CMD_PORT), timeout=timeout)
         self._cmd = cmd
         cmd.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._tune_dead_link_detection(cmd)
         video = socket.create_connection((host, proto.VIDEO_PORT), timeout=timeout)
         self._video = video
         # Blocking reads after connect; dead links are detected by recv/send errors.
@@ -91,10 +107,12 @@ class FreenoveClient:
         )
         self._video_thread.start()
         self._reader_thread.start()
+        self._start_keepalive()
         log.info("connected to %s:%s / :%s", host, proto.CMD_PORT, proto.VIDEO_PORT)
 
     def disconnect(self) -> None:
         """Clean disconnect: stop walking, then close both sockets."""
+        self._stop_keepalive_thread()
         if self._connected and self._cmd is not None:
             try:
                 with self._cmd_lock:
@@ -110,6 +128,57 @@ class FreenoveClient:
                 t.join(timeout=1.0)
         self._video_thread = None
         self._reader_thread = None
+
+    @staticmethod
+    def _tune_dead_link_detection(sock: socket.socket) -> None:
+        """Ask the OS to notice a dead Wi-Fi link within seconds, not minutes.
+
+        Best effort: options that this system does not have are skipped.
+        """
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for name, value in (
+                ("TCP_KEEPIDLE", 5),
+                ("TCP_KEEPINTVL", 2),
+                ("TCP_KEEPCNT", 3),
+                ("TCP_USER_TIMEOUT", 8000),  # milliseconds, Linux only
+            ):
+                opt = getattr(socket, name, None)
+                if opt is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError as exc:  # pragma: no cover - platform specific
+            log.debug("could not tune socket: %s", exc)
+
+    # ---- keep-alive ------------------------------------------------------
+
+    def _start_keepalive(self) -> None:
+        self._stop_keepalive.clear()
+        self._repeat_line = None
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, name="freenove-keepalive", daemon=True
+        )
+        self._keepalive_thread.start()
+
+    def _stop_keepalive_thread(self) -> None:
+        with self._repeat_lock:
+            self._repeat_line = None
+        self._stop_keepalive.set()
+        t = self._keepalive_thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.0)
+        self._keepalive_thread = None
+
+    def _keepalive_loop(self) -> None:
+        while not self._stop_keepalive.wait(self.keepalive_interval):
+            with self._repeat_lock:
+                line = self._repeat_line
+                if not line or not self._connected:
+                    continue
+                try:
+                    self.send(line)
+                except RuntimeError:
+                    # send() already flagged the lost connection for the UI.
+                    return
 
     def _close_sockets(self) -> None:
         for sock in (self._cmd, self._video):
@@ -131,6 +200,7 @@ class FreenoveClient:
         if not self._connected or self._stop_reader.is_set():
             return
         self._connected = False
+        self._repeat_line = None
         self.lost_reason = reason
         log.warning("connection lost: %s", reason)
         self._stop_video.set()
@@ -159,14 +229,20 @@ class FreenoveClient:
         raise RuntimeError(f"connection lost: {err}")
 
     def walk(self, direction: str, speed: int = proto.DEFAULT_SPEED, mode: int = 1) -> None:
-        self.send(proto.cmd_walk(direction, speed=speed, mode=mode))
+        line = proto.cmd_walk(direction, speed=speed, mode=mode)
+        with self._repeat_lock:
+            self.send(line)
+            # Only a walk the server keeps repeating needs the keep-alive.
+            self._repeat_line = line if proto.is_continuous_move(line) else None
 
     def turn(self, direction: str, speed: int = proto.DEFAULT_SPEED, mode: int = 1) -> None:
         """direction: 'left' or 'right' (uses CMD_MOVE's angle field)."""
         self.walk(f"turn_{direction}", speed=speed, mode=mode)
 
     def stop(self, mode: int = 1) -> None:
-        self.send(proto.cmd_stop(mode))
+        with self._repeat_lock:
+            self._repeat_line = None  # first: so no walk can be repeated after this
+            self.send(proto.cmd_stop(mode))
 
     def head(self, axis: int, angle: int) -> None:
         """Raw, clamped servo angle (see protocol.cmd_head)."""
@@ -280,6 +356,8 @@ class MockClient(FreenoveClient):
         self._stop_mock = threading.Event()
         self._frame = MOCK_JPEG
         self.sent: list[str] = []
+        # Set to e.g. (6.5, 6.4) to make practice mode report a low battery.
+        self.mock_power: Optional[tuple[float, float]] = None
 
     def connect(self, host: str = "mock", timeout: float = 5.0, **_: object) -> None:  # noqa: ARG002
         self.disconnect()
@@ -290,9 +368,11 @@ class MockClient(FreenoveClient):
             target=self._mock_loop, name="freenove-mock", daemon=True
         )
         self._mock_thread.start()
+        self._start_keepalive()
         log.info("mock client connected (%s)", host)
 
     def disconnect(self) -> None:
+        self._stop_keepalive_thread()
         if self._connected:
             self.sent.append(proto.cmd_stop().strip())
         self._connected = False
@@ -312,6 +392,8 @@ class MockClient(FreenoveClient):
         self.sent.append(text)
         log.info("mock TX %s", text)
         reply = proto.mock_reply(text)
+        if self.mock_power and text.split("#", 1)[0] == "CMD_POWER":
+            reply = f"CMD_POWER#{self.mock_power[0]}#{self.mock_power[1]}"
         if reply is not None:
             self._handle_reply(reply)
 

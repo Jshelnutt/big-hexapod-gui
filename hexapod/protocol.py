@@ -158,3 +158,19 @@ def mock_reply(line: str) -> str | None:
     if head == "CMD_POWER":
         return "CMD_POWER#8.1#8.05"
     return None
+
+
+def is_continuous_move(line: str) -> bool:
+    """True for a CMD_MOVE the stock server keeps repeating until told to stop.
+
+    The stock server walks again and again for a CMD_MOVE with a non-zero x or y,
+    but runs only one step for a turn (x and y both 0) or a stop. Only the first
+    kind needs the app's keep-alive repeat.
+    """
+    parts = line.strip().split("#")
+    if len(parts) != 6 or parts[0] != "CMD_MOVE":
+        return False
+    try:
+        return int(parts[2]) != 0 or int(parts[3]) != 0
+    except ValueError:
+        return False

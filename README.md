@@ -58,6 +58,48 @@ Then connect the UI to `127.0.0.1` with Mock off.
 - Live JPEG preview
 - Mock mode for development without hardware
 
+## Safety features
+
+### "Before you run it" checklist
+
+After you connect, the app reads both battery packs (`CMD_POWER`) and shows them
+above the controls. The walk and move controls (arrows, speed, gait mode, Servos ON,
+head) stay **locked** until:
+
+- the battery has been read and **both packs are above 6.6 V** (at 6.6 V or below,
+  walking is blocked; below 7.0 V you get a low-battery warning but can still walk), and
+- you tick all three boxes: **legs clear**, **robot lifted for first tests**,
+  **someone watching**.
+
+The **Stop** button, **Relax**, and **Buzz** always work. The boxes reset every time you
+connect. The battery is re-read every 30 seconds; if it falls to 6.6 V or below while
+you are walking, the app sends a stop and locks the controls again.
+**Practice mode** works as before: it has no robot, so the boxes are optional there.
+The thresholds are at the top of `hexapod/preflight.py`.
+
+### Test log
+
+Every run (from the first walk command until Stop, Relax, disconnect, a lost connection, or
+a low battery) is saved as one line in a local file:
+`~/.big-hexapod-gui/test-log.jsonl` (change it with the `HEXAPOD_TEST_LOG` environment
+variable). Each entry has the date and time, the mode (robot or practice), the gait mode,
+the commands that ran, both battery voltages, and a result plus your note.
+Open the **Test log** section of the app to type a note, see the latest entries, or
+download the file. The file is plain text — any editor opens it.
+
+### Stop if the connection drops
+
+- The app sends a **stop** when you press Stop, press Disconnect, close the page, or
+  quit the app (this part already existed).
+- **New:** while a walk is running, the app repeats the walk command about every 0.4 s
+  (a "keep-alive"), and asks the operating system to notice a dead Wi‑Fi link within
+  seconds. If the app, the computer or the Wi‑Fi goes away, the repeats just stop.
+- **New, on the Pi:** a small watchdog halts the robot when no command has arrived for
+  about 1 second. It is a separate add-on, not part of Freenove's code — see
+  [`pi/README.md`](pi/README.md). **It is untested on the robot; test it with the robot
+  lifted on a stand.** Without it, the stock Freenove server keeps repeating the last walk
+  command if the connection dies without closing.
+
 ## Out of scope (v0)
 
 - Replacing Freenove Server with ROS / custom gait
@@ -71,6 +113,8 @@ Then connect the UI to `127.0.0.1` with Mock off.
 pip install -r requirements.txt
 pytest -q
 ```
+
+(`pytest.ini` puts the repo folder on the import path, so plain `pytest -q` works.)
 
 ## Sources
 
